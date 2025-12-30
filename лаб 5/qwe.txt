@@ -1,0 +1,1205 @@
+  Белорусский государственный технологический университет
+Факультет информационных технологий
+Кафедра программной инженерии
+ 
+ 
+ 
+ 
+Лабораторная работа 5
+По дисциплине «Операционные системы»
+На тему «Диспетчеризация и планирование»
+ 
+ 
+ 
+ 
+ 
+ 
+Выполнил:
+Студентка 3 курса 9 группы
+Бондарик Никита Дмитриевич
+Преподаватель: Савельева М.Г.
+
+
+Минск, 2025 
+Введение
+Современные операционные системы способны одновременно обрабатывать большое количество процессов и потоков, распределяя нагрузку между доступными процессорными ресурсами. Корректное управление планированием выполнения задач является ключевым фактором эффективной работы вычислительной системы.
+Цель данной лабораторной работы — на практике изучить особенности планирования потоков в ОС Windows и Linux, разобраться с механизмом приоритетов процессов и потоков, а также освоить инструменты их наблюдения и анализа.
+В ходе выполнения работы требуется создать несколько консольных программ, отображающих идентификаторы процессов и потоков, их приоритеты, маски привязки к процессорам и данные о фактическом выполнении. Также необходимо провести серию экспериментов с изменением приоритетов процессов и потоков, сравнить полученные результаты и проанализировать различия в продуктивности с помощью средств мониторинга, таких как Process Explorer.
+Выполнение лабораторной работы помогает укрепить теоретические знания о планировании вычислений в ОС и получить практический опыт изучения поведения многопоточных приложений в многопроцессорной среде.
+ 
+1	Windows
+1.1 Задание 4-5
+Приложение Lab-05a является консольным приложением, которое выводит следующую информацию: PID, TID, класс приоритетов текущего процесса, приоритет текущего потока, маску родственности процесса в двоичном виде, системную маску родственности в двоичном виде, количество процессоров доступных для выполнения процессу, Номер процессора, назначенного для выполнения текущему потоку.
+Исходный код программы Lab-05a представлен на листинге 1.1.
+#include <windows.h>
+
+static HANDLE GetOut(void) {
+    return GetStdHandle(STD_OUTPUT_HANDLE);
+}
+
+static void WriteStringW(LPCWSTR s) {
+    if (!s) return;
+    DWORD n = 0;
+    WriteConsoleW(GetOut(), s, lstrlenW(s), &n, NULL);
+}
+
+static void WriteCharW(WCHAR c) {
+    DWORD n = 0;
+    WriteConsoleW(GetOut(), &c, 1, &n, NULL);
+}
+
+static void WriteLineW(LPCWSTR s) {
+    WriteStringW(s);
+    WriteStringW(L"\r\n");
+}
+
+// Десятичное целое без знака
+static void WriteDecU32(DWORD v) {
+    WCHAR buf[16]; // достаточно для 32-битного числа
+    int i = 0;
+    if (v == 0) {
+        WriteCharW(L'0');
+        return;
+    }
+    while (v > 0 && i < (int)(sizeof(buf)/sizeof(buf[0]))) {
+        buf[i++] = (WCHAR)(L'0' + (v % 10));
+        v /= 10;
+    }
+    while (i-- > 0) WriteCharW(buf[i]);
+}
+
+// Десятичное целое со знаком для int (например приоритет потока)
+static void WriteDecI32(int v) {
+    if (v < 0) { WriteCharW(L'-'); v = -v; }
+    WriteDecU32((DWORD)v);
+}
+
+// Шестнадцатеричное без префикса (фиксированный размер для указателя/маски)
+static void WriteHexPtr(DWORD_PTR v) {
+    // Выведем без лишних leading zeros? Оставим компактный вариант
+    WCHAR hexDigits[] = L"0123456789ABCDEF";
+    WCHAR buf[2 * sizeof(DWORD_PTR)];
+    int i = 0;
+    int started = 0;
+    for (int shift = (int)(sizeof(DWORD_PTR) * 8) - 4; shift >= 0; shift -= 4) {
+        DWORD_PTR nibble = (v >> shift) & 0xF;
+        if (nibble || started) {
+            buf[i++] = hexDigits[nibble];
+            started = 1;
+        }
+    }
+    if (!started) { // v == 0
+        buf[i++] = L'0';
+    }
+    DWORD n = 0;
+    WriteConsoleW(GetOut(), buf, i, &n, NULL);
+}
+
+// Печать последнего кода ошибки с префиксом (русским)
+static void PrintLastErrorW(LPCWSTR prefix) {
+    DWORD err = GetLastError();
+    LPWSTR msg = NULL;
+    DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+    DWORD lang = MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT);
+    FormatMessageW(flags, NULL, err, lang, (LPWSTR)&msg, 0, NULL);
+    if (prefix) WriteStringW(prefix);
+    if (msg) {
+        WriteStringW(msg);
+        LocalFree(msg);
+    } else {
+        WriteStringW(L"(не удалось получить текст ошибки)\r\n");
+    }
+}
+
+// Печать двоичной маски (с пробелом каждые 4 бита)
+static void print_binary_mask(DWORD_PTR mask) {
+    int bits = (int)(sizeof(DWORD_PTR) * 8);
+    for (int i = bits - 1; i >= 0; --i) {
+        DWORD_PTR bit = ((mask >> i) & 1);
+        WriteCharW(bit ? L'1' : L'0');
+        if (i % 4 == 0 && i != 0) WriteCharW(L' ');
+    }
+}
+
+// Подсчет количества установленных битов
+static int count_bits(DWORD_PTR mask) {
+    int cnt = 0;
+    while (mask) {
+        if (mask & 1) ++cnt;
+        mask >>= 1;
+    }
+    return cnt;
+}
+
+// Строка для класса приоритета процесса (Unicode)
+static LPCWSTR proc_priority_class_to_str(DWORD cls) {
+    switch (cls) {
+        case IDLE_PRIORITY_CLASS:          return L"IDLE_PRIORITY_CLASS";
+        case BELOW_NORMAL_PRIORITY_CLASS:  return L"BELOW_NORMAL_PRIORITY_CLASS";
+        case NORMAL_PRIORITY_CLASS:        return L"NORMAL_PRIORITY_CLASS";
+        case ABOVE_NORMAL_PRIORITY_CLASS:  return L"ABOVE_NORMAL_PRIORITY_CLASS";
+        case HIGH_PRIORITY_CLASS:          return L"HIGH_PRIORITY_CLASS";
+        case REALTIME_PRIORITY_CLASS:      return L"REALTIME_PRIORITY_CLASS";
+        default:                           return L"UNKNOWN_PRIORITY_CLASS";
+    }
+}
+
+//
+// ======= Точка входа без CRT =======
+//
+void WINAPI WinMainCRTStartup(void) {
+    // Получение идентификаторов
+    DWORD processId = GetCurrentProcessId();
+    DWORD threadId  = GetCurrentThreadId();
+
+    HANDLE hProcess = GetCurrentProcess();
+    HANDLE hThread  = GetCurrentThread();
+
+    // Класс приоритета процесса
+    DWORD procPriorityClass = GetPriorityClass(hProcess);
+    if (procPriorityClass == 0) {
+        WriteStringW(L"Ошибка GetPriorityClass, код ошибки: ");
+        WriteDecU32(GetLastError());
+        WriteLineW(L"");
+    }
+
+    // Приоритет потока
+    int threadPriority = GetThreadPriority(hThread);
+    if (threadPriority == THREAD_PRIORITY_ERROR_RETURN) {
+        WriteStringW(L"Ошибка GetThreadPriority, код ошибки: ");
+        WriteDecU32(GetLastError());
+        WriteLineW(L"");
+    }
+
+    // Маски родства (affinity)
+    DWORD_PTR procAffinity = 0;
+    DWORD_PTR sysAffinity  = 0;
+    if (!GetProcessAffinityMask(hProcess, &procAffinity, &sysAffinity)) {
+        WriteStringW(L"Ошибка GetProcessAffinityMask, код ошибки: ");
+        WriteDecU32(GetLastError());
+        WriteLineW(L"");
+    }
+
+    int availableProcessors = count_bits(procAffinity);
+
+    // Текущий номер процессора
+    DWORD currentCpu = (DWORD)-1;
+    // На поддерживаемых системах доступно всегда
+    currentCpu = GetCurrentProcessorNumber();
+
+    // Вывод
+    WriteStringW(L"Идентификатор процесса (PID): ");
+    WriteDecU32(processId);
+    WriteLineW(L"");
+
+    WriteStringW(L"Идентификатор потока (TID): ");
+    WriteDecU32(threadId);
+    WriteLineW(L"");
+
+    if (procPriorityClass != 0) {
+        WriteStringW(L"Класс приоритетов процесса: ");
+        WriteStringW(proc_priority_class_to_str(procPriorityClass));
+        WriteStringW(L" (0x");
+        WriteHexPtr(procPriorityClass);
+        WriteLineW(L")");
+    } else {
+        WriteLineW(L"Класс приоритетов процесса: (не удалось получить)");
+    }
+
+    if (threadPriority != THREAD_PRIORITY_ERROR_RETURN) {
+        WriteStringW(L"Приоритет текущего потока: ");
+        WriteDecI32(threadPriority);
+        WriteLineW(L" (THREAD_PRIORITY_*)");
+    } else {
+        WriteLineW(L"Приоритет текущего потока: (не удалось получить)");
+    }
+
+    WriteStringW(L"Маска родства процесса (processAffinityMask): 0b");
+    print_binary_mask(procAffinity);
+    WriteStringW(L" (0x");
+    WriteHexPtr(procAffinity);
+    WriteLineW(L")");
+
+    WriteStringW(L"Системная маска родства (systemAffinityMask): 0b");
+    print_binary_mask(sysAffinity);
+    WriteStringW(L" (0x");
+    WriteHexPtr(sysAffinity);
+    WriteLineW(L")");
+
+    WriteStringW(L"Количество процессоров, доступных для выполнения процессу: ");
+    WriteDecU32((DWORD)availableProcessors);
+    WriteLineW(L"");
+
+    if (currentCpu != (DWORD)-1) {
+        WriteStringW(L"Номер процессора, выполняющего текущий поток: ");
+        WriteDecU32(currentCpu);
+        WriteLineW(L"");
+    } else {
+        WriteLineW(L"Номер процессора: (не удалось получить)");
+    }
+
+    ExitProcess(0);
+}
+Листинг 1.1 – Исходный код приложения Lab-05a
+Результаты выполнения приложения Lab-05a представлена на рисунке 1.1.
+ 
+Рисунок 1.1 – Результат выполнения приложения Lab-05a !узнать
+Приложение Lab-05x является консольным приложением, которое выполняет 1000000 итераций. Каждые 1000 итераций происходит задержка 200 мс и выводит следующую информацию: Номер итерации, PID, TID, класс приоритета процесса, приоритет потока, номер назначенного процессора.
+Исходный код программы Lab-05x представлен на листинге 1.2.
+#include <windows.h>
+
+static HANDLE GetOut(void) {
+    return GetStdHandle(STD_OUTPUT_HANDLE);
+}
+
+static void WriteStringW(LPCWSTR s) {
+    if (!s) return;
+    DWORD n;
+    WriteConsoleW(GetOut(), s, lstrlenW(s), &n, NULL);
+}
+
+static void WriteLineW(LPCWSTR s) {
+    WriteStringW(s);
+    WriteStringW(L"\r\n");
+}
+
+static void WriteCharW(WCHAR c) {
+    DWORD n;
+    WriteConsoleW(GetOut(), &c, 1, &n, NULL);
+}
+
+static void WriteDecU32(DWORD v) {
+    WCHAR buf[16];
+    int i = 0;
+    if (v == 0) { WriteCharW(L'0'); return; }
+    while (v > 0 && i < 16) {
+        buf[i++] = (WCHAR)(L'0' + (v % 10));
+        v /= 10;
+    }
+    while (i-- > 0) WriteCharW(buf[i]);
+}
+
+static void WriteDecI32(int v) {
+    if (v < 0) { WriteCharW(L'-'); v = -v; }
+    WriteDecU32((DWORD)v);
+}
+
+//
+// ======= Приоритет процесса =======
+//
+static LPCWSTR proc_priority_class_to_str(DWORD cls) {
+    switch (cls) {
+        case IDLE_PRIORITY_CLASS:          return L"IDLE";
+        case BELOW_NORMAL_PRIORITY_CLASS:  return L"BELOW_NORMAL";
+        case NORMAL_PRIORITY_CLASS:        return L"NORMAL";
+        case ABOVE_NORMAL_PRIORITY_CLASS:  return L"ABOVE_NORMAL";
+        case HIGH_PRIORITY_CLASS:          return L"HIGH";
+        case REALTIME_PRIORITY_CLASS:      return L"REALTIME";
+        default:                           return L"UNKNOWN";
+    }
+}
+
+//
+// ======= Точка входа =======
+//
+void WINAPI WinMainCRTStartup(void) {
+    DWORD pid = GetCurrentProcessId();
+    HANDLE hProcess = GetCurrentProcess();
+    HANDLE hThread  = GetCurrentThread();
+
+    LARGE_INTEGER freq, start, end;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+
+    for (int i = 1; i <= 1000000; i++) {
+        if (i % 1000 == 0) {
+            Sleep(200);
+
+            DWORD tid = GetCurrentThreadId();
+            DWORD procClass = GetPriorityClass(hProcess);
+            int threadPrio  = GetThreadPriority(hThread);
+            DWORD cpu       = GetCurrentProcessorNumber();
+
+            WriteStringW(L"Итерация: ");
+            WriteDecU32(i);
+            WriteLineW(L"");
+
+            WriteStringW(L"PID: ");
+            WriteDecU32(pid);
+            WriteLineW(L"");
+
+            WriteStringW(L"TID: ");
+            WriteDecU32(tid);
+            WriteLineW(L"");
+
+            WriteStringW(L"Класс приоритета процесса: ");
+            WriteLineW(proc_priority_class_to_str(procClass));
+
+            WriteStringW(L"Приоритет потока: ");
+            WriteDecI32(threadPrio);
+            WriteLineW(L"");
+
+            WriteStringW(L"Назначенный процессор: ");
+            WriteDecU32(cpu);
+            WriteLineW(L"");
+
+            WriteLineW(L"------------------------------");
+        }
+    }
+
+    QueryPerformanceCounter(&end);
+    double time_sec = (double)(end.QuadPart - start.QuadPart) / (double)freq.QuadPart;
+
+    WriteLineW(L"");
+    WriteStringW(L"Время выполнения: ");
+    // Выводим секунды как целую и дробную часть
+    DWORD whole = (DWORD)time_sec;
+    WriteDecU32(whole);
+    WriteCharW(L'.');
+    DWORD frac = (DWORD)((time_sec - whole) * 1000); // миллисекунды
+    WriteDecU32(frac);
+    WriteLineW(L" сек");
+
+    ExitProcess(0);
+}
+Листинг 1.2 – Исходный код приложения Lab-05x
+Начало выполнения программы Lab-05x представлена на рисунке 1.2.
+ 
+Рисунок 1.2 – Начало выполнения приложения Lab-05x
+В конце своей работы приложение Lab-05x выводит на консоль время прошедшее с момента своего запуска.
+
+ 
+Рисунок 1.3 – Завершение приложения Lab-05x
+Приложение Lab-05b является консольным приложением, которое принимает следующие аргументы: P1 – целое число, задающее маску родственности процессоров. P2 – целое число, задающее класс приоритета первого дочернего процесса. P3 – целое число, задающее класс приоритета второго дочернего процесса.
+Приложение должно выводить заданные параметры на консоль и запускать два одинаковых дочерних процесса на основе приложения Lab-05x, осуществляющих вывод в разные консольные окна и имеющие заданные приоритеты.
+Исходный код приложения Lab-05b представлена на рисунке 1.3.
+#include <windows.h>
+
+//
+// ======= Утилиты вывода =======
+//
+static HANDLE GetOut(void) {
+    return GetStdHandle(STD_OUTPUT_HANDLE);
+}
+
+static void WriteStringW(LPCWSTR s) {
+    DWORD n;
+    WriteConsoleW(GetOut(), s, lstrlenW(s), &n, NULL);
+}
+
+static void WriteLineW(LPCWSTR s) {
+    WriteStringW(s);
+    WriteStringW(L"\r\n");
+}
+
+static void WriteCharW(WCHAR c) {
+    DWORD n;
+    WriteConsoleW(GetOut(), &c, 1, &n, NULL);
+}
+
+static void WriteDecU32(DWORD v) {
+    WCHAR buf[16];
+    int i = 0;
+    if (v == 0) { WriteCharW(L'0'); return; }
+    while (v > 0 && i < 16) {
+        buf[i++] = (WCHAR)(L'0' + (v % 10));
+        v /= 10;
+    }
+    while (i-- > 0) WriteCharW(buf[i]);
+}
+
+//
+// ======= Приоритеты =======
+//
+static void PrintPriorityName(DWORD cls) {
+    switch (cls) {
+        case REALTIME_PRIORITY_CLASS:      WriteStringW(L"REALTIME"); break;
+        case HIGH_PRIORITY_CLASS:          WriteStringW(L"HIGH"); break;
+        case ABOVE_NORMAL_PRIORITY_CLASS:  WriteStringW(L"ABOVE NORMAL"); break;
+        case NORMAL_PRIORITY_CLASS:        WriteStringW(L"NORMAL"); break;
+        case BELOW_NORMAL_PRIORITY_CLASS:  WriteStringW(L"BELOW NORMAL"); break;
+        case IDLE_PRIORITY_CLASS:          WriteStringW(L"IDLE"); break;
+        default:                           WriteStringW(L"UNKNOWN"); break;
+    }
+}
+
+static DWORD ToPriorityClass(int p) {
+    switch (p) {
+        case 0: return IDLE_PRIORITY_CLASS;
+        case 1: return BELOW_NORMAL_PRIORITY_CLASS;
+        case 2: return NORMAL_PRIORITY_CLASS;
+        case 3: return ABOVE_NORMAL_PRIORITY_CLASS;
+        case 4: return HIGH_PRIORITY_CLASS;
+        case 5: return REALTIME_PRIORITY_CLASS;
+        default: return NORMAL_PRIORITY_CLASS;
+    }
+}
+
+//
+// ======= Точка входа =======
+//
+int wmain(int argc, wchar_t* argv[]) {
+    if (argc < 4) {
+        WriteLineW(L"Lab-05b: <P1_mask> <P2_priority> <P3_priority>");
+        return 0;
+    }
+
+    DWORD mask = wcstoul(argv[1], NULL, 10);
+    int p2 = _wtoi(argv[2]);
+    int p3 = _wtoi(argv[3]);
+
+    DWORD prio2 = ToPriorityClass(p2);
+    DWORD prio3 = ToPriorityClass(p3);
+
+    WriteLineW(L"=== Параметры ===");
+    WriteStringW(L"Mask (P1): ");
+    WriteDecU32(mask);
+    WriteLineW(L"");
+
+    WriteStringW(L"P2 = ");
+    PrintPriorityName(prio2);
+    WriteLineW(L"");
+
+    WriteStringW(L"P3 = ");
+    PrintPriorityName(prio3);
+    WriteLineW(L"");
+    WriteLineW(L"");
+
+    STARTUPINFOW si1 = { sizeof(STARTUPINFOW) };
+    PROCESS_INFORMATION pi1 = {0};
+
+    STARTUPINFOW si2 = { sizeof(STARTUPINFOW) };
+    PROCESS_INFORMATION pi2 = {0};
+
+    // Команда запуска дочерних процессов
+    WCHAR childCmd1[] = L"C:\\Users\\useer-b9497e4c\\source\\repos\\OS5LAB\\x64\\Debug\\Lab-05x.exe";
+    WCHAR childCmd2[] = L"C:\\Users\\useer-b9497e4c\\source\\repos\\OS5LAB\\x64\\Debug\\Lab-05x.exe";
+
+    if (!CreateProcessW(
+        NULL,
+        childCmd1,
+        NULL, NULL, FALSE,
+        CREATE_NEW_CONSOLE | CREATE_SUSPENDED,
+        NULL, NULL,
+        &si1, &pi1
+    )) {
+        WriteStringW(L"Невозможно запустить 1-ый процесс. Код = ");
+        WriteDecU32(GetLastError());
+        WriteLineW(L"");
+        return 1;
+    }
+
+    if (!CreateProcessW(
+        NULL,
+        childCmd2,
+        NULL, NULL, FALSE,
+        CREATE_NEW_CONSOLE | CREATE_SUSPENDED,
+        NULL, NULL,
+        &si2, &pi2
+    )) {
+        WriteStringW(L"Невозможно запустить 2-ой процесс. Код = ");
+        WriteDecU32(GetLastError());
+        WriteLineW(L"");
+        return 1;
+    }
+
+    SetProcessAffinityMask(pi1.hProcess, mask);
+    SetProcessAffinityMask(pi2.hProcess, mask);
+    SetPriorityClass(pi1.hProcess, prio2);
+    SetPriorityClass(pi2.hProcess, prio3);
+
+    ResumeThread(pi1.hThread);
+    ResumeThread(pi2.hThread);
+
+    WriteLineW(L"Процесс начался.");
+    WriteStringW(L"PID1 = ");
+    WriteDecU32(pi1.dwProcessId);
+    WriteLineW(L"");
+
+    WriteStringW(L"PID2 = ");
+    WriteDecU32(pi2.dwProcessId);
+    WriteLineW(L"");
+    WriteLineW(L"");
+
+    WaitForSingleObject(pi1.hProcess, INFINITE);
+    WaitForSingleObject(pi2.hProcess, INFINITE);
+
+    CloseHandle(pi1.hProcess);
+    CloseHandle(pi1.hThread);
+    CloseHandle(pi2.hProcess);
+    CloseHandle(pi2.hThread);
+
+    WriteLineW(L"Все процессы завершены.");
+    return 0;
+}
+Листинг 1.3 – Исходный код приложения Lab-05b
+Требуется провести серию замеров разными параметрами. Для первого замера требуются следующие параметры:Lab-05b.exe -1 2 2. Этот тест проводится на следующие параметры: P1 – все процессоры, P2 – Normal, P3 – Normal. Результаты выполнения программы предоставлены на рисунке 1.4. 
+ 
+Рисунок 1.4 – Выполнение приложения Lab_05b с первым замером
+Завершение потоков представлено на рисунке 1.4.
+ 
+Рисунок 1.4 – Завершение потоков первого замера
+Для второго замера требуются следующие параметрыLab-05b.exe -1 1 4. Этот тест проводится на следующие параметры: P1 – все процессоры, P2 – Below Normal, P3 – High. Результаты выполнения программы предоставлены на рисунке 1.5. 
+ 
+Рисунок 1.5 – Выполнение приложения Lab_05b с вторым замером
+Для третьего замера требуются следующие параметры:Lab-05b.exe 1 1 4. Этот тест проводится на следующие параметры: P1 – 1 процессор, P2 – Below Normal, P3 – High. Результаты выполнения программы предоставлены на рисунке 1.6. 
+ 
+Рисунок 1.6 – Выполнение приложения Lab_05b с третьим замером
+Также необходимо изучить с помощью Process Explorer информацию о приоритетах выполняющихся приложений. Приоритет потока Lab-05x.exe отражен на рисунке 1.7.
+ 
+Рисунок 1.7 – Приоритет потока Lab-05b
+Программа Lab-05c представляет консольное приложение, принимающая следующие параметры: P1 – целое число, задающее маску родственности процессоров. P2 – целое число, задающее класс приоритета процесса. P3 – целое число, задающее класс приоритета первого дочернего потока. P4 – целое число, задающее класс приоритета второго дочернего потока. Приложение содержит потоковую функцию аналогичную приложению Lab-05x.
+Приложение должно выводить заданные параметры на консоль и запускать два одинаковых дочерних потока, осуществляющих вывод в консольное окна и имеющие заданные приоритеты.
+Исходный код программы Lab-05c представлен на листинге 1.4.
+#include <windows.h>
+static HANDLE GetOut(void) {
+    return GetStdHandle(STD_OUTPUT_HANDLE);
+}
+
+static void WriteStringW(LPCWSTR s) {
+    DWORD n;
+    WriteConsoleW(GetOut(), s, lstrlenW(s), &n, NULL);
+}
+
+static void WriteLineW(LPCWSTR s) {
+    WriteStringW(s);
+    WriteStringW(L"\r\n");
+}
+
+static void WriteCharW(WCHAR c) {
+    DWORD n;
+    WriteConsoleW(GetOut(), &c, 1, &n, NULL);
+}
+
+static void WriteDecU32(DWORD v) {
+    WCHAR buf[16];
+    int i = 0;
+    if (v == 0) { WriteCharW(L'0'); return; }
+    while (v > 0 && i < 16) {
+        buf[i++] = (WCHAR)(L'0' + (v % 10));
+        v /= 10;
+    }
+    while (i-- > 0) WriteCharW(buf[i]);
+}
+
+static void WriteDecI32(int v) {
+    if (v < 0) { WriteCharW(L'-'); v = -v; }
+    WriteDecU32((DWORD)v);
+}
+
+//
+// ======= Приоритеты =======
+//
+static DWORD ToProcessPriority(int p) {
+    switch (p) {
+        case 0: return IDLE_PRIORITY_CLASS;
+        case 1: return BELOW_NORMAL_PRIORITY_CLASS;
+        case 2: return NORMAL_PRIORITY_CLASS;
+        case 3: return ABOVE_NORMAL_PRIORITY_CLASS;
+        case 4: return HIGH_PRIORITY_CLASS;
+        case 5: return REALTIME_PRIORITY_CLASS;
+        default: return NORMAL_PRIORITY_CLASS;
+    }
+}
+
+static int ToThreadPriority(int p) {
+    switch (p) {
+        case 0: return THREAD_PRIORITY_IDLE;
+        case 1: return THREAD_PRIORITY_LOWEST;
+        case 2: return THREAD_PRIORITY_BELOW_NORMAL;
+        case 3: return THREAD_PRIORITY_NORMAL;
+        case 4: return THREAD_PRIORITY_ABOVE_NORMAL;
+        case 5: return THREAD_PRIORITY_HIGHEST;
+        case 6: return THREAD_PRIORITY_TIME_CRITICAL;
+        default: return THREAD_PRIORITY_NORMAL;
+    }
+}
+
+//
+// ======= Данные потока =======
+//
+struct ThreadData {
+    int id;
+};
+
+//
+// ======= Функция потока =======
+//
+DWORD WINAPI WorkerThread(LPVOID arg) {
+    ThreadData* data = (ThreadData*)arg;
+
+    LARGE_INTEGER freq, start, end;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+
+    const int TOTAL_ITERS = 1000000;
+
+    for (int i = 1; i <= TOTAL_ITERS; i++) {
+        if (i % 1000 == 0) {
+            Sleep(200);
+
+            WriteStringW(L"[Поток ");
+            WriteDecI32(data->id);
+            WriteStringW(L"] Итерация = ");
+            WriteDecU32(i);
+            WriteLineW(L"");
+
+            WriteStringW(L"  PID:            ");
+            WriteDecU32(GetCurrentProcessId());
+            WriteLineW(L"");
+
+            WriteStringW(L"  TID:            ");
+            WriteDecU32(GetCurrentThreadId());
+            WriteLineW(L"");
+
+            WriteStringW(L"  Класс приоритета процесса: ");
+            WriteDecU32(GetPriorityClass(GetCurrentProcess()));
+            WriteLineW(L"");
+
+            WriteStringW(L"  Приоритет потока:          ");
+            WriteDecI32(GetThreadPriority(GetCurrentThread()));
+            WriteLineW(L"");
+
+            WriteStringW(L"  Номер процессора:          ");
+            WriteDecU32(GetCurrentProcessorNumber());
+            WriteLineW(L"");
+
+            WriteLineW(L"--------------------------------------");
+        }
+    }
+
+    QueryPerformanceCounter(&end);
+    double secs = (double)(end.QuadPart - start.QuadPart) / (double)freq.QuadPart;
+
+    WriteStringW(L"[Поток ");
+    WriteDecI32(data->id);
+    WriteStringW(L"] Завершён за ");
+    DWORD whole = (DWORD)secs;
+    WriteDecU32(whole);
+    WriteCharW(L'.');
+    DWORD frac = (DWORD)((secs - whole) * 1000); // миллисекунды
+    WriteDecU32(frac);
+    WriteLineW(L" сек");
+
+    return 0;
+}
+
+
+int wmain(int argc, wchar_t* argv[]) {
+    if (argc < 5) {
+        WriteLineW(L"Lab-05c.exe <Маска_процессора> <Приоритет_процесса> <Приоритет_поток1> <Приоритет_поток2>");
+        return 0;
+    }
+
+    DWORD mask = wcstoul(argv[1], NULL, 10);
+    int p2 = _wtoi(argv[2]);
+    int p3 = _wtoi(argv[3]);
+    int p4 = _wtoi(argv[4]);
+
+    DWORD procPrio = ToProcessPriority(p2);
+    int thrPrio1 = ToThreadPriority(p3);
+    int thrPrio2 = ToThreadPriority(p4);
+
+    WriteLineW(L"=== Параметры запуска ===");
+    WriteStringW(L"Маска процессора (P1): ");
+    WriteDecU32(mask);
+    WriteLineW(L"");
+
+    WriteStringW(L"Класс приоритета процесса (P2): ");
+    WriteDecU32(procPrio);
+    WriteLineW(L"");
+
+    WriteStringW(L"Приоритет потока 1 (P3): ");
+    WriteDecI32(thrPrio1);
+    WriteLineW(L"");
+
+    WriteStringW(L"Приоритет потока 2 (P4): ");
+    WriteDecI32(thrPrio2);
+    WriteLineW(L"");
+    WriteLineW(L"");
+
+    SetProcessAffinityMask(GetCurrentProcess(), mask);
+    SetPriorityClass(GetCurrentProcess(), procPrio);
+
+    ThreadData d1 = { 1 };
+    ThreadData d2 = { 2 };
+
+    HANDLE hThread1 = CreateThread(NULL, 0, WorkerThread, &d1, CREATE_SUSPENDED, NULL);
+    HANDLE hThread2 = CreateThread(NULL, 0, WorkerThread, &d2, CREATE_SUSPENDED, NULL);
+
+    SetThreadPriority(hThread1, thrPrio1);
+    SetThreadPriority(hThread2, thrPrio2);
+
+    ResumeThread(hThread1);
+    ResumeThread(hThread2);
+
+    WaitForSingleObject(hThread1, INFINITE);
+    WaitForSingleObject(hThread2, INFINITE);
+
+    CloseHandle(hThread1);
+    CloseHandle(hThread2);
+
+    WriteLineW(L"Все потоки завершены.");
+    return 0;
+}
+Листинг 1.4 – Исходный код приложения Lab-05c
+Требуется провести серию замеров разными параметрами. Для первого замера требуются следующие параметры: Lab-05c.exe -1 3 3 3. Этот тест проводится на следующие параметры: P1 – Все процессоры, P2 –Normal, P3 – Normal, P4 - Normal. Результаты выполнения программы предоставлены на рисунке 1.8. 
+ 
+Рисунок 1.8 – Выполнение приложения Lab_05c с первым замером
+Требуется провести серию замеров разными параметрами. Для второго замера требуются следующие параметры: Lab-05c.exe -1 3 1 5. Этот тест проводится на следующие параметры: P1 – Все процессоры, P2 –Normal, P3 – Lowest, P4 - Highest. Результаты выполнения программы предоставлены на рисунке 1.9.
+Разница в итерациях между потоками представлена на рисунке 1.9.
+
+ 
+Рисунок 1.9 – Выполнение приложения Lab_05c с вторым замером
+Требуется провести серию замеров разными параметрами. Для третьего замера требуются следующие параметры: Lab-05c.exe 1 3 1 5. Этот тест проводится на следующие параметры: P1 – 1 процессор, P2 –Normal, P3 – Lowest, P4 - Highest. Результаты выполнения программы предоставлены на рисунке 1.10. 
+Также необходимо изучить с помощью Process Explorer информацию о приоритетах потоков. Приоритет отражен на рисунке 1.10.
+ 
+Рисунок 1.10 – Приоритет потоков
+Разница в итерациях между потоком 1 и потоком 2 показана на рисунке 1.11.
+ 
+Рисунок 1.11 – Выполнение приложения Lab_05c с третьим замером
+В параметрах Base Pri и Dyn Pri отображены различия в приоритетах потоков.
+
+
+
+
+
+
+
+2 Linux
+2.1	Задание 4-5
+Программа Lab_05a является полным аналогом программы из заданий для Windows, за исключением ненадобности вывода маски родственности. Исходный код программы предоставлен на листинге 2.1.
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+
+int main(void) {
+    pid_t pid = getpid();
+    pid_t tid = syscall(SYS_gettid);
+
+    // Класс планировщика
+    int policy = sched_getscheduler(0);
+
+    struct sched_param sp;
+    sched_getparam(0, &sp);
+
+    // Маска аффинности
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    if (sched_getaffinity(0, sizeof(cpuset), &cpuset) == -1) {
+        perror("sched_getaffinity");
+        return 1;
+    }
+
+    long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    int current_cpu = sched_getcpu();
+
+    printf("PID процесса: %d\n", pid);
+    printf("TID потока: %d\n", tid);
+
+    printf("Класс планировщика: ");
+    switch (policy) {
+        case SCHED_OTHER:    printf("SCHED_OTHER\n"); break;
+        case SCHED_FIFO:     printf("SCHED_FIFO\n"); break;
+        case SCHED_RR:       printf("SCHED_RR\n"); break;
+#ifdef SCHED_BATCH
+        case SCHED_BATCH:    printf("SCHED_BATCH\n"); break;
+#endif
+#ifdef SCHED_IDLE
+        case SCHED_IDLE:     printf("SCHED_IDLE\n"); break;
+#endif
+#ifdef SCHED_DEADLINE
+        case SCHED_DEADLINE: printf("SCHED_DEADLINE\n"); break;
+#endif
+        default:             printf("Неизвестный (%d)\n", policy); break;
+    }
+
+    printf("Приоритет потока: %d\n", sp.sched_priority);
+
+    printf("Маска аффинности процесса (в двоичном виде): ");
+    for (int i = 0; i < cpu_count; i++) {
+        printf("%d", CPU_ISSET(i, &cpuset) ? 1 : 0);
+    }
+    printf("\n");
+
+    printf("Количество доступных процессоров: %ld\n", cpu_count);
+    printf("Текущий CPU: %d\n", current_cpu);
+
+    return 0;
+}
+
+
+Листинг 2.1 – Исходный код приложения Lab-05a
+Результат выполнения программы Lab-05a предоставлен на рисунке 2.1.
+ 
+Рисунок 2.1 – Результат выполнения программы Lab-05a
+Программа Lab-05x представляет консольное приложение, выполняющее цикл на 1 млн. итераций. Каждые 1000 итераций происходит задержка в 200мс, а также вывод следующей информации: номер итерации, идентификатор процесса, идентификатор потока, уровень любезности, номер назначенного процессора.
+Исходный код программы представлен на листинге 2.2.
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <sched.h>
+#include <time.h>
+
+int get_nice_value() {
+    long kprio = syscall(SYS_getpriority, 0, 0);
+    return (int)(kprio - 20);
+}
+
+int main(void) {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    const int total_iterations = 1000000;
+
+    for (int i = 1; i <= total_iterations; i++) {
+        if (i % 1000 == 0) {
+            usleep(200 * 1000); // 200 ms
+
+            pid_t pid = getpid();
+            pid_t tid = syscall(SYS_gettid);
+            int nice_val = get_nice_value();
+            int cpu = sched_getcpu();
+
+            printf("Итерация: %d\n", i);
+            printf("PID: %d\n", pid);
+            printf("TID: %d\n", tid);
+            printf("Уровень любезности: %d\n", nice_val);
+            printf("CPU: %d\n", cpu);
+            printf("-----------------------------\n");
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) +
+                     (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    printf("Реальное время выполнения программы: %.3f сек.\n", elapsed);
+
+    return 0;
+}
+Листинг 2.2 – Исходный код приложения Lab-05x
+Результат начала выполнения программы Lab-05x предоставлен на рисунке 2.2.
+ 
+Рисунок 2.2 – Начало выполнения программы Lab-05x
+Результат конца выполнения программы Lab-05x предоставлен на рисунке 2.3.
+ 
+Рисунок 2.3 – Конец выполнения программы Lab-05x
+Программа Lab-05b представляет консольное приложение, принимающие следующие параметры: P1 – целое число, задающее маску родственности процессоров; P2 – целое число, задающее класс приоритета первого дочернего процесса; P3 – целое число, задающее класс приоритета второго дочернего процесса.
+Приложение должно выводить заданные параметры на консоль и запускать два одинаковых дочерних процесса на основе приложения Lab-05x, осуществляющих вывод в консольное окно и имеющие заданные приоритеты (через nice).
+Исходный код программы Lab-05b представлен на листинге 2.3.
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sched.h>
+#include <errno.h>
+#include <string.h>
+
+void PrintPriorityName(int niceVal) {
+    if (niceVal < -10)        printf("HIGH");
+    else if (niceVal < 0)     printf("ABOVE NORMAL");
+    else if (niceVal == 0)    printf("NORMAL");
+    else if (niceVal <= 10)   printf("BELOW NORMAL");
+    else                      printf("IDLE");
+}
+
+void SetAffinity(unsigned long mask) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+
+    if (mask == 0) {
+        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        for (int i = 0; i < cpus; i++)
+            CPU_SET(i, &set);
+    } else {
+        for (int i = 0; i < 64; i++) {
+            if (mask & (1UL << i))
+                CPU_SET(i, &set);
+        }
+    }
+
+    if (sched_setaffinity(0, sizeof(set), &set) == -1)
+        fprintf(stderr, "Ошибка установки привязки CPU: %s\n", strerror(errno));
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 4) {
+        printf("./Task3 <P1_mask> <P2_nice> <P3_nice>\n");
+        return 0;
+    }
+
+    unsigned long mask = strtoul(argv[1], NULL, 10);
+    int nice1 = atoi(argv[2]);
+    int nice2 = atoi(argv[3]);
+
+    printf("Параметры запуска:\n");
+    printf("Маска CPU: %lu\n", mask);
+
+    printf("Приоритет процесса 1: ");
+    PrintPriorityName(nice1);
+    printf("\n");
+
+    printf("Приоритет процесса 2: ");
+    PrintPriorityName(nice2);
+    printf("\n\n");
+
+    const char* childApp = "../Task2/Lab-05x";
+
+    pid_t pid1 = fork();
+    if (pid1 == 0) {
+        nice(nice1);
+        SetAffinity(mask);
+        execl(childApp, childApp, NULL);
+        fprintf(stderr, "Ошибка запуска процесса: %s\n", strerror(errno));
+        return 1;
+    }
+
+    pid_t pid2 = fork();
+    if (pid2 == 0) {
+        nice(nice2);
+        SetAffinity(mask);
+        execl(childApp, childApp, NULL);
+        fprintf(stderr, "Ошибка запуска процесса: %s\n", strerror(errno));
+        return 1;
+    }
+
+    waitpid(pid1, NULL, 0);
+    waitpid(pid2, NULL, 0);
+
+    printf("\nВсе дочерние процессы завершены.\n");
+    printf("PID процесса 1: %d\n", pid1);
+    printf("PID процесса 2: %d\n", pid2);
+
+    return 0;
+}
+Листинг 2.3 – Исходный код приложения Lab-05b
+Требовалось провести разные замеры для значений P1 P2 P3. Для первого замера требовалось запустить программу с следующими параметрами: ./lab-05b 0 0 0. Результат начала выполнения программы Lab-05c предоставлен на рисунке 2.2.
+ 
+Рисунок 2.2 – Начало выполнения программы Lab-05b для первого замера
+Результат конца выполнения программы Lab-05b предоставлен на рисунке 2.3.
+ 
+Рисунок 2.3 – Конец выполнения программы Lab-05b для первого замера
+Для второго замера требовалось запустить программу с следующими параметрами: ./lab-05b 1 19 -20. Результат начала выполнения программы Lab-05cпредоставлен на рисунке 2.4. 
+¬¬¬ 
+Рисунок 2.4 – Начало выполнения программы Lab-05b для второго замера
+Результат конца выполнения программы Lab-05b предоставлен на рисунке 2.5.
+ 
+Рисунок 2.5 – Конец выполнения программы Lab-05b для второго замера
+Для третьего замера требовалось запустить программу с следующими параметрами: ./Lab-05b 0 -19 20. Результат начала выполнения программы Lab-05c предоставлен на рисунке 2.6. 
+  
+Рисунок 2.6 – Начало выполнения программы Lab-05b для третьего замера
+Разница в итерациях представлена на рисунке результат конца выполнения программы Lab-05b предоставлен на рисунке 2.7.
+ 
+Рисунок 2.7 – Конец выполнения программы Lab-05b для третьего замера
+Так же требовалось просмотреть каталог /proc и воспользоваться командой ps, просмотрев параметры при выполнении приложения. Результаты команды ps представлены на рисунке 2.8.
+ 
+Рисунок 2.8 – Результат команды ps 
+Результаты просмотра каталога /proc представлены на рисунке 2.9.
+ 
+Рисунок 2.9 – Результат просмотра каталога /proc 
+Программа Lab-05c представляет консольное приложение, принимающие следующие параметры: P1 – целое число, задающее маску родственности процессоров; P2 – целое число, задающее класс приоритета первого дочернего процесса; P3 – целое число, задающее класс приоритета второго дочернего процесса.
+Приложение должно выводить заданные параметры на консоль и запускать два одинаковых дочерних процесса на основе приложения Lab-05x, осуществляющих вывод в консольное окно и имеющие заданные приоритеты.
+Исходный код программы Lab-05c представлен на листинге 2.4.
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <sched.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <time.h>
+
+struct ThreadData {
+    int id;
+    int niceValue;
+};
+
+void SetProcessAffinity(unsigned long mask) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+
+    if (mask == 0) {
+        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        for (int i = 0; i < cpus; i++)
+            CPU_SET(i, &set);
+    } else {
+        for (int i = 0; i < 64; i++) {
+            if (mask & (1UL << i))
+                CPU_SET(i, &set);
+        }
+    }
+
+    if (sched_setaffinity(0, sizeof(set), &set) == -1)
+        fprintf(stderr, "Affinity error: %s\n", strerror(errno));
+}
+
+void* WorkerThread(void* arg) {
+    struct ThreadData* data = (struct ThreadData*)arg;
+
+    if (setpriority(PRIO_PROCESS, 0, data->niceValue) == -1)
+        fprintf(stderr, "setpriority error: %s\n", strerror(errno));
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    const int TOTAL_ITERS = 1000000;
+
+    for (int i = 1; i <= TOTAL_ITERS; i++) {
+        if (i % 1000 == 0) {
+            usleep(200000); // 200 ms
+
+            int nice_now = getpriority(PRIO_PROCESS, 0);
+
+            printf("[Поток %d] Итерация = %d\n", data->id, i);
+            printf("  PID: %d\n", getpid());
+            printf("  TID: %ld\n", (long)syscall(SYS_gettid));
+            printf("  Nice: %d\n", nice_now);
+            printf("  CPU: %d\n", sched_getcpu());
+            printf("--------------------------------------\n");
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double secs = (end.tv_sec - start.tv_sec) +
+                  (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    printf("[Поток %d] Закончился за %.3f сек\n", data->id, secs);
+    return NULL;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 4) {
+        printf("./Lab-05c <P1_mask> <P2_thr1_nice> <P3_thr2_nice>\n");
+        return 0;
+    }
+
+    unsigned long mask = strtoul(argv[1], NULL, 10);
+    int nice1 = atoi(argv[2]);
+    int nice2 = atoi(argv[3]);
+
+    printf("Параметры\n");
+    printf("P1 Mask: %lu\n", mask);
+    printf("P2 Thread1 Nice: %d\n", nice1);
+    printf("P3 Thread2 Nice: %d\n\n", nice2);
+
+    SetProcessAffinity(mask);
+
+    pthread_t t1, t2;
+    struct ThreadData d1 = {1, nice1};
+    struct ThreadData d2 = {2, nice2};
+
+    pthread_create(&t1, NULL, WorkerThread, &d1);
+    pthread_create(&t2, NULL, WorkerThread, &d2);
+
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+
+    printf("\nВсе потоки закончены\n");
+    return 0;
+}
+Листинг 2.4 – Исходный код приложения Lab-05c
+Требовалось провести разные замеры для значений P1 P2 P3. Для первого замера требовалось запустить программу с следующими параметрами: ./Lab-05c 0 0 0. Результат начала выполнения программы Lab-05c предоставлен на рисунке 2.10. 
+ 
+Рисунок 2.10 – Начало выполнения программы Lab-05c для первого замера
+Результат конца выполнения программы Lab-05c предоставлен на рисунке 2.11.
+ 
+Рисунок 2.11 – Конец выполнения программы Lab-05c для первого замера
+Для второго замера требовалось запустить программу с следующими параметрами: ./Lab-05c 1 -19 20. Результат начала выполнения программы Lab-05c предоставлен на рисунке 2.12. 
+ 
+Рисунок 2.12 – Начало выполнения программы Lab-05c для второго замера
+Результат конца выполнения программы Lab-05c предоставлен на рисунке 2.13.
+ 
+Рисунок 2.13 – Конец выполнения программы Lab-05c для второго замера
+Для третьего замера требовалось запустить программу с следующими параметрами: ./Lab-05c 0 -19 20. Результат начала выполнения программы Lab-05c предоставлен на рисунке 2.14. 
+  
+Рисунок 2.14 – Начало выполнения программы Lab-05c для третьего замера
+Результат конца выполнения программы Lab-05c предоставлен на рисунке 2.15.
+ 
+Рисунок 2.15 – Конец выполнения программы Lab-05c для третьего замера
+Так же требовалось просмотреть расхождение в выполненных итерациях, скриншот представлен на рисунке 2.16.
+ 
+Рисунок 2.16 – расхождение в итерациях 
+Разница в итерациях отсутсвует.
+Вывод!
+ 
+1. Поясните понятия планирование и диспетчеризация?
+Планирование - это стратегический процесс определения порядка выполнения задач (процессов/потоков) процессором. Решает, какая задача будет выполняться следующей.
+Диспетчеризация - это тактический процесс переключения контекста: сохранение состояния текущей задачи, загрузка состояния следующей задачи и передача ей управления процессором.
+2. Опишите процесс диспетчеризации?
+Процесс диспетчеризации включает:
+1.	Сохранение контекста текущего процесса (регистры, состояние программы)
+2.	Выбор следующего процесса из очереди готовых к выполнению
+3.	Восстановление его контекста
+4.	Передача управления выбранному процессу
+5.	Обновление структур данных планировщика
+3. Что такое планировщик? Какие бывают планировщики?
+Планировщик - компонент ОС, распределяющий ресурсы процессора между задачами.
+Виды планировщиков:
+•	Долгосрочный (адмиссионный) - решает, какие процессы допустить к исполнению
+•	Среднесрочный - управляет своппингом процессов между памятью и диском
+•	Краткосрочный (CPU-планировщик) - распределяет процессорное время между готовыми процессами
+4. Какой из планировщиков определяет степень мультизадачности ОС?
+Краткосрочный планировщик определяет степень мультизадачности, так как он решает, как часто и какие процессы будут получать кванты времени CPU.
+5. Какие виды алгоритмов планирования вы знаете?
+•	Вытесняющие (preemptive) - ОС может прервать выполнение процесса
+•	Невытесняющие (non-preemptive) - процесс выполняется до завершения или добровольного освобождения CPU
+•	С приоритетами
+•	Циклические (Round Robin)
+•	Многоуровневые очереди
+•	Многоуровневые очереди с обратной связью (MLFQ)
+•	Самый короткий процесс первый (SJF)
+•	Гарантированное планирование
+6. Перечислите общие и специфичные задачи планирования
+Общие задачи:
+•	Справедливость распределения CPU
+•	Максимальная утилизация процессора
+•	Минимизация времени отклика
+•	Минимизация времени ожидания
+Специфичные задачи:
+•	Обработка реального времени
+•	Балансировка нагрузки в многопроцессорных системах
+•	Учет энергопотребления (в мобильных системах)
+7. Поясните понятие «циклическое планирование»
+Циклическое планирование (Round Robin) - алгоритм, где каждому процессу выделяется фиксированный квант времени CPU. Если процесс не завершился за квант, он перемещается в конец очереди. Гарантирует справедливость, но может увеличивать время отклика.
+8. Поясните понятие «приоритетное планирование»
+Приоритетное планирование - алгоритм, где каждому процессу назначается приоритет. Процесс с наивысшим приоритетом выполняется первым. Может быть вытесняющим (процесс с более высоким приоритетом прерывает текущий) или невытесняющим.
+9. Поясните понятие «приоритет процесса»
+Приоритет процесса - числовое значение, определяющее важность процесса относительно других. Влияет на порядок получения CPU. Может быть статическим (назначается при создании) или динамическим (меняется во время выполнения).
+10. Что такое базовый приоритет потока в Windows?
+В Windows базовый приоритет потока вычисляется на основе:
+•	Класса приоритета процесса
+•	Относительного приоритета потока внутри процесса
+Диапазон: от 0 (низший) до 31 (высший) для реального времени, от 1 до 15 для обычных процессов.
+11. Поясните принцип использования значения nice в Linux
+nice - значение "любезности" процесса в Linux, влияющее на его приоритет. Диапазон: от -20 (наивысший приоритет) до 19 (наинизший). Чем выше значение nice, тем "любезнее" процесс (реже получает CPU). Только суперпользователь может устанавливать отрицательные значения.
+12. Поясните понятие «кооперативное планирование»
+Кооперативное планирование - невытесняющий метод, где процесс добровольно освобождает CPU (через системные вызовы, операции ввода-вывода или явный вызов yield). Проблема: зависший процесс может заблокировать всю систему.
+13. Поясните понятие «родственное планирование»
+Родственное планирование (affinity scheduling) - привязка процесса/потока к конкретным процессорам или ядрам. Уменьшает затраты на миграцию кэшей между процессорами, но может вызвать дисбаланс нагрузки.
+14. Что такое маска родственности? Как задать?
+Маска родственности - битовая маска, где каждый бит соответствует доступному процессору. Устанавливается через:
+•	Windows: SetProcessAffinityMask(), SetThreadAffinityMask()
+•	Linux: sched_setaffinity(), pthread_setaffinity_np()
+•	Команды: taskset (Linux), start /affinity (Windows)
+15. Что такое перепланировка? Когда наступает момент перепланировки?
+Перепланировка - активация планировщика для выбора нового процесса к выполнению.
+Моменты перепланировки:
+1.	Завершение процесса
+2.	Блокировка процесса (ожидание I/O, семафора и т.д.)
+3.	Прерывание от таймера (истечение кванта времени)
+4.	Появление процесса с более высоким приоритетом
+5.	Добровольное освобождение CPU (yield)
+6.	Изменение приоритета или маски родственности
+
